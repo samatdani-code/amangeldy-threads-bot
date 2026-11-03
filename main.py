@@ -3,6 +3,7 @@ import os
 import json
 import sqlite3
 import hashlib
+from contextvars import ContextVar
 import logging
 import threading
 import time
@@ -17,6 +18,7 @@ TZ = ZoneInfo('Asia/Almaty')
 log = logging.getLogger('threads-bot')
 LOCK = threading.RLock()
 STOP = threading.Event()
+REPLY_CHAT = ContextVar('reply_chat', default=None)
 
 
 def now():
@@ -92,14 +94,17 @@ def tg(method, payload):
 
 def send(text):
     for start in range(0, len(text), 3500):
-        tg('sendMessage', {'chat_id': os.environ['TELEGRAM_OWNER_ID'], 'text': text[start:start+3500]})
+        tg('sendMessage', {'chat_id': REPLY_CHAT.get() or os.environ['TELEGRAM_OWNER_ID'], 'text': text[start:start+3500]})
 
 
 def notify(text):
+    ctx = REPLY_CHAT.set(None)
     try:
         send(text)
     except Exception:
         log.warning('Notification failed')
+    finally:
+        REPLY_CHAT.reset(ctx)
 
 
 def token():
@@ -318,8 +323,23 @@ HELP = '''Amangeldy Threads Manager
 
 def handle(msg):
     owner = int(os.environ['TELEGRAM_OWNER_ID'])
-    if msg.get('from',{}).get('id') != owner or msg.get('chat',{}).get('id') != owner:
+    allowed = {owner} | {int(v.strip()) for v in os.getenv('TELEGRAM_ALLOWED_IDS','').split(',') if v.strip()}
+    uid = msg.get('from',{}).get('id')
+    if uid not in allowed or msg.get('chat',{}).get('id') != uid:
         return
+    ctx = REPLY_CHAT.set(uid)
+    try:
+        try:
+            handle_authorized(msg)
+        except ServiceError as error:
+            send(str(error))
+    finally:
+        REPLY_CHAT.reset(ctx)
+
+
+def handle_authorized(msg):
+    owner = int(os.environ['TELEGRAM_OWNER_ID'])
+    delete_key = 'delete_pending:' + str(msg['from']['id'])
     text = msg.get('text', '').strip()
     cmd, _, arg = text.partition(' ')
     cmd = cmd.split('@')[0].lower()
@@ -366,10 +386,10 @@ def handle(msg):
         if not p:
             send('Не найден опубликованный пост бота.')
             return
-        put('delete_pending',json.dumps({'id':int(arg),'until':time.time()+300}))
+        put(delete_key,json.dumps({'id':int(arg),'until':time.time()+300}))
         send(f"Удалить пост #{arg}?\n{p[0]['text']}\n\nДля удаления в течение 5 минут: /confirm_delete {arg}")
     elif cmd == '/confirm_delete' and arg.isdigit():
-        pending = json.loads(get('delete_pending','{}'))
+        pending = json.loads(get(delete_key,'{}'))
         if pending.get('id') != int(arg) or pending.get('until',0) < time.time():
             send('Сначала /delete ID')
             return
@@ -378,7 +398,7 @@ def handle(msg):
             with LOCK:
                 check()
                 # No automatic retry on ambiguous deletion.
-                put('delete_pending','{}')
+                put(delete_key,'{}')
                 result = threads('DELETE',p[0]['media'])
                 if result.get('success') is not True:
                     raise ServiceError('Удаление не подтверждено API. Проверьте Threads вручную.')
