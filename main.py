@@ -44,7 +44,9 @@ def init():
         ''')
         c.execute("INSERT OR IGNORE INTO settings VALUES('paused','1')")
         c.execute("INSERT OR IGNORE INTO settings VALUES('third','0')")
-        c.execute("UPDATE posts SET state='uncertain' WHERE state='publishing'")
+        recovered = c.execute("UPDATE posts SET state='uncertain' WHERE state='publishing'").rowcount
+        if recovered:
+            c.execute("INSERT OR REPLACE INTO settings VALUES('paused','1')")
 
 
 def get(k, default=''):
@@ -130,6 +132,8 @@ def check():
 def search():
     config = json.loads((ROOT / 'editor.json').read_text())
     added = 0
+    # Never reuse a successful count after a later failed search.
+    put('last_search_count', 0)
     for q in config['queries']:
         data = threads('GET', 'keyword_search', {'q': q, 'search_type': 'RECENT',
             'fields': 'id,text,permalink,timestamp,username', 'limit': 25})
@@ -179,7 +183,8 @@ def validate(post, history):
 def generate(slot):
     config = json.loads((ROOT / 'editor.json').read_text())
     history = rows("SELECT text,rubric FROM posts WHERE state IN ('published','ready','uncertain') ORDER BY id DESC LIMIT 40")
-    topics = rows('SELECT id,text,url FROM topics ORDER BY created DESC LIMIT 50')
+    topics = rows('SELECT id,text,url FROM topics WHERE created >= ? ORDER BY created DESC LIMIT 50',
+                  ((now() - timedelta(days=7)).isoformat(),))
     rubrics = config['rubrics']
     base = now().weekday()
     rubric = rubrics[(base + int(slot[:2]) // 5) % len(rubrics)]
@@ -225,6 +230,11 @@ def publish(post):
     with LOCK:
         if get('paused') != '0':
             return
+        # A caller may hold a stale row; claim only a ready database record.
+        current = rows("SELECT * FROM posts WHERE id=? AND state='ready'", (post['id'],))
+        if not current:
+            return
+        post = current[0]
         check()
         execute("UPDATE posts SET state='publishing' WHERE id=?", (post['id'],))
         try:
@@ -363,7 +373,13 @@ def handle_authorized(msg):
     elif cmd == '/status':
         send(f"Автопостинг: {'включён' if get('paused')=='0' else 'пауза'}\nТретий пост: {get('third')}\nПоследний поиск: {get('last_search','не запускался')}\nНовых тем: {get('last_search_count','0')}")
     elif cmd == '/search':
-        send(f'Поиск завершён. Добавлено тем: {search()}')
+        try:
+            send(f'Поиск завершён. Добавлено тем: {search()}')
+        except ServiceError as error:
+            send(str(error) + '\nПоиск требует разрешения threads_keyword_search в самом токене '
+                 'и соответствующего доступа приложения Meta. Наличие разрешения в панели '
+                 'не означает, что оно выдано токену. Проверьте области доступа в отладчике Meta. '
+                 'Пока доступны резервные темы; повторная генерация токена без нужного разрешения не поможет.')
     elif cmd == '/preview':
         slot = now().strftime('%H:%M:%S.%f')
         pid = generate(slot)
@@ -413,11 +429,13 @@ def main():
     for key in ('TELEGRAM_BOT_TOKEN','TELEGRAM_OWNER_ID','OPENAI_API_KEY','THREADS_ACCESS_TOKEN'):
         if not os.getenv(key):
             raise SystemExit('Не задана переменная '+key)
-    init()
     # Single process only: volume must not be shared by concurrent replicas.
     import fcntl
-    lockfile = open(Path(os.getenv('RAILWAY_VOLUME_MOUNT_PATH','/data'))/'worker.lock','w')
+    volume = Path(os.getenv('RAILWAY_VOLUME_MOUNT_PATH','/data'))
+    volume.mkdir(parents=True, exist_ok=True)
+    lockfile = open(volume/'worker.lock','w')
     fcntl.flock(lockfile,fcntl.LOCK_EX | fcntl.LOCK_NB)
+    init()
     tg('deleteWebhook',{'drop_pending_updates':False})
     threading.Thread(target=scheduler,daemon=True).start()
     notify('Бот запущен. /status — состояние, /help — команды. После первой установки автопостинг на паузе.')
